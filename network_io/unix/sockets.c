@@ -220,6 +220,21 @@ apr_status_t apr_socket_bind(apr_socket_t *sock, apr_sockaddr_t *sa)
         return errno;
     }
     else {
+#if APR_HAVE_SCTP
+        if (sock->protocol == IPPROTO_SCTP) {
+            apr_sockaddr_t *next_sa = sa;
+            while (next_sa = next_sa->next) {
+                if (sctp_bindx(sock->socketdes, (struct sockaddr*)&next_sa->sa,
+                               1, SCTP_BINDX_ADD_ADDR) == -1) {
+                    char addr[16];
+                    inet_ntop(next_sa->sa.sin.sin_family,
+                          &next_sa->sa.sin.sin_addr, addr, 16);
+                    printf("bindx(%s) failed with errno = %d (%s).\n",
+                           addr, errno, strerror(errno));
+                }
+            }
+        }
+#endif
         sock->local_addr = sa;
         /* XXX IPv6 - this assumes sin_port and sin6_port at same offset */
 #if APR_HAVE_SOCKADDR_UN
@@ -289,6 +304,35 @@ apr_status_t apr_socket_accept(apr_socket_t **new, apr_socket_t *sock,
      * socket: */
     set_socket_vars(*new, sa.sa.sin.sin_family, SOCK_STREAM, sock->protocol);
 
+#if APR_HAS_SCTP_STREAMS
+ 
+   /*
+    * PN - 08/30/05
+    * Set initmsg notification for SCTP
+    */
+ 
+   if (sock->protocol == APR_PROTO_SCTP) {
+
+        /* PN - 10/13/2005 
+	 * Number of In/Out Streams negotiation - Hardcoded.
+         */
+
+        struct sctp_initmsg  initmsg;
+        bzero(&initmsg, sizeof(initmsg));
+
+        initmsg.sinit_num_ostreams = 64;
+        initmsg.sinit_max_instreams = 64;
+        initmsg.sinit_max_attempts = 3;
+
+        if (setsockopt(sock->socketdes, IPPROTO_SCTP, SCTP_INITMSG, &initmsg,
+        			sizeof(struct sctp_initmsg)) == -1) {
+            return errno;
+        }
+
+   }
+
+#endif
+
 #ifndef HAVE_POLL
     (*new)->connected = 1;
 #endif
@@ -301,6 +345,27 @@ apr_status_t apr_socket_accept(apr_socket_t **new, apr_socket_t *sock,
     /* Copy in peer's address. */
     (*new)->remote_addr->sa = sa.sa;
     (*new)->remote_addr->salen = sa.salen;
+
+#if APR_HAS_SCTP_STREAMS
+
+    /*
+     * PN - 08/30/05
+     * Set event subscription for SCTP
+     */
+
+    if ((*new)->protocol == APR_PROTO_SCTP) {
+
+        struct sctp_event_subscribe events;
+        bzero(&events, sizeof(events));
+        events.sctp_data_io_event = 1;
+        if (setsockopt((*new)->socketdes, IPPROTO_SCTP, SCTP_EVENTS, 
+			&events, sizeof(events)) == -1) {
+            return errno;
+        }
+    }
+
+#endif
+
 
     *(*new)->local_addr = *sock->local_addr;
 

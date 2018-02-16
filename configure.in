@@ -757,6 +757,7 @@ case $host in
       AC_SEARCH_LIBS(crypt, crypt ufc)
       AC_CHECK_LIB(truerand, main)
       AC_SEARCH_LIBS(modf, m)
+      AC_CHECK_LIB(sctp, sctp_bindx)
        ;;
 esac
 
@@ -1477,6 +1478,37 @@ if test "$apr_cv_hdr_netinet_tcp_h" = "yes"; then
 else
    netinet_tcph=0
 fi
+
+dnl ---------------------------- Checking for sendmsg & recvmsg
+dnl needed to send on SCTP streams
+dnl JTL - 2013-MAR-22, modified to support building on linux
+echo "${nl}Checking for sendmsg & recvmsg..."
+AC_CHECK_FUNCS( \
+sendmsg \
+recvmsg \
+)
+case $host in
+    *freebsd*|*darwin*)
+        if test "$ac_cv_func_sendmsg" = "yes" -a "$ac_cv_func_recvmsg" = "yes" -a "$netinet_sctp_uioh" = "1"; then
+            AC_SUBST(has_sctp_streams, 1)
+        else
+            AC_SUBST(has_sctp_streams, 0)
+            AC_MSG_WARN(SCTP Warning: One or more of {sendmsg, recvmsg, sctp_uio.h} was not found. SCTP with streams cannot be used.)
+        fi
+        ;;
+    *linux*)
+        if test "$ac_cv_func_sendmsg" = "yes" -a "$ac_cv_func_recvmsg" = "yes"; then
+            AC_SUBST(has_sctp_streams, 1)
+        else
+            AC_SUBST(has_sctp_streams, 0)
+            AC_MSG_WARN(SCTP Warning: One or more of {sendmsg, recvmsg} was not found. SCTP with streams cannot be used.)
+        fi
+        ;;
+    *)
+        AC_SUBST(has_sctp_streams, 0)
+        AC_MSG_WARN(SCTP Warning: SCTP with streams is not supported on this platform.)
+        ;;
+esac
 
 AC_SUBST(aioh)
 AC_SUBST(arpa_ineth)

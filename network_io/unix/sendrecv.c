@@ -27,6 +27,34 @@
 #include <osreldate.h>
 #endif
 
+/*
+ * PN - 10/14/2005
+ * sendmsg version of apr_socket_send_sctp
+ * Similar to apr_socket_send, but sends on a particular SCTP stream
+ * given by the caller.
+ */
+
+#if APR_HAS_SCTP_STREAMS
+
+apr_status_t apr_socket_send_sctp(apr_socket_t *sock, const char *buf,
+                             apr_size_t *len, apr_uint16_t stream_id)
+{
+    apr_ssize_t rv;
+
+    struct iovec vec;
+    apr_int32_t nvec = 1;
+
+    memset(&vec, 0, sizeof(struct iovec));
+    vec.iov_base = (void *)buf;
+    vec.iov_len = (*len);
+
+    rv = apr_socket_sendv_sctp(sock, &vec, nvec, len, stream_id);
+
+    return rv;
+   
+}
+#endif  /* End APR_HAS_SCTP_STREAMS */
+
 apr_status_t apr_socket_send(apr_socket_t *sock, const char *buf, 
                              apr_size_t *len)
 {
@@ -66,6 +94,138 @@ do_select:
     (*len) = rv;
     return APR_SUCCESS;
 }
+
+/*
+ * PN - 10/14/2005
+ * recvmsg version of apr_socket_recv_sctp
+ * Similar to apr_socket_recv, but finds out the SCTP stream on which
+ * message arrived and passes it to caller.
+ */
+
+#if APR_HAS_SCTP_STREAMS
+
+apr_status_t apr_socket_recv_sctp(apr_socket_t *sock, char *buf,
+                        apr_size_t *len, apr_uint16_t *stream_id)
+{
+    apr_ssize_t rv;
+    apr_status_t arv;
+
+    struct cmsghdr   *cmsg;
+    struct sctp_sndrcvinfo  *sri;
+    char  cbuf[sizeof (*cmsg) + sizeof (*sri)];
+    struct msghdr  msg;
+    struct iovec vec;
+
+    apr_int32_t msg_flags, bytes_read = 0;
+
+    /* Fill up iovec */
+    vec.iov_base = (void *)buf;
+    vec.iov_len = (*len);
+
+    /* Fill up the msghdr structure */
+    bzero(&msg, sizeof(msg));
+
+    /* Not filling up msg_name and msg_namelen members */
+    msg.msg_iov = &vec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof (*cmsg) + sizeof (*sri);
+
+    /* Fill up cmsghdr structure */
+    memset(cbuf, 0, sizeof (*cmsg) + sizeof (*sri));
+    cmsg = (struct cmsghdr *)cbuf;
+    sri = (struct sctp_sndrcvinfo *)(cmsg + 1);
+
+    if (sock->options & APR_INCOMPLETE_READ) {
+        sock->options &= ~APR_INCOMPLETE_READ;
+        goto do_select;
+    }
+
+    do {
+        msg.msg_flags = 0;
+        rv = recvmsg(sock->socketdes, &msg, 0);
+        msg_flags = msg.msg_flags;
+
+        if (rv > 0) {
+            if (msg_flags & MSG_NOTIFICATION) {
+               /* Received a notification - not data. Continue reading */
+                continue;
+            }
+            vec.iov_base = (char *)vec.iov_base + rv;
+            vec.iov_len += rv;
+            bytes_read += rv;
+
+            if (!(msg_flags & MSG_EOR)) {
+               /* End of message not reached. Continue reading */
+                continue;
+
+            }
+        }
+
+    } while (rv == -1 && errno == EINTR);
+
+
+   /* FIXME:: Chaning the _while_ to _if_ as in apr-0.9.6 
+    * FreeBSD's KAME-SCTP returns -1 with EWOULDBLOCK even
+    * if peer closed socket. 
+    */
+   /* while (rv == -1 && (errno == EAGAIN || errno == EWOULDBLOCK) */
+   if (rv == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)  
+                    && (sock->timeout > 0)) {
+
+do_select:
+        arv = apr_wait_for_io_or_timeout(NULL, sock, 1);
+        if (arv != APR_SUCCESS) {
+            *len = 0;
+            return arv;
+        }
+        else {
+            do {
+                msg.msg_flags = 0;
+                rv = recvmsg(sock->socketdes, &msg, 0);
+                msg_flags = msg.msg_flags;
+
+                if (rv > 0) {
+                    if (msg_flags & MSG_NOTIFICATION) {
+                         continue;
+                    }
+
+                    vec.iov_base = (char *)vec.iov_base + rv;
+                    vec.iov_len += rv;
+                    bytes_read += rv;
+
+                    if (!(msg_flags & MSG_EOR)) {
+                        continue;
+
+                    }
+               }
+
+            } while (rv == -1 && errno == EINTR);
+        }
+    }
+    if (rv == -1) {
+        (*len) = 0;
+        return errno;
+    }
+
+    if (stream_id) {
+        (*stream_id) = sri->sinfo_stream;
+    }
+
+    if ((sock->timeout > 0) && (bytes_read < *len)) {
+        sock->options |= APR_INCOMPLETE_READ;
+    }
+    (*len) = bytes_read;
+    if (rv == 0) {
+        return APR_EOF;
+    }
+    return APR_SUCCESS;
+
+}
+
+#endif /* End APR_HAS_SCTP_STREAMS */
+
+
 
 apr_status_t apr_socket_recv(apr_socket_t *sock, char *buf, apr_size_t *len)
 {
@@ -190,6 +350,91 @@ apr_status_t apr_socket_recvfrom(apr_sockaddr_t *from, apr_socket_t *sock,
 
     return APR_SUCCESS;
 }
+
+/*
+ * PN - 8/30/05
+ * apr_socket_sendv_sctp = {writev + send on a particular sctp stream}
+ */
+
+#if APR_HAS_SCTP_STREAMS
+
+apr_status_t apr_socket_sendv_sctp(apr_socket_t * sock, const struct iovec *vec,
+                                apr_int32_t nvec, apr_size_t *len,
+                                apr_uint16_t stream_id)
+{
+    apr_ssize_t rv;
+    struct cmsghdr   *cmsg;
+    struct sctp_sndrcvinfo  *sri;
+    char  cbuf[sizeof (*cmsg) + sizeof (*sri)];
+    struct msghdr  msg;
+    apr_int32_t i, requested_len = 0;
+
+    for (i = 0; i < nvec; i++) {
+        requested_len += vec[i].iov_len;
+    }
+
+    /* Fill up the msghdr structure */
+    bzero(&msg, sizeof(msg));
+
+    /* Not filling up msg_name and msg_namelen members */
+    msg.msg_iov = (struct iovec *)vec;
+    msg.msg_iovlen = nvec;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof (*cmsg) + sizeof (*sri);
+    msg.msg_flags = 0;
+
+    /* Fill up cmsghdr structure */
+    memset(cbuf, 0, sizeof (*cmsg) + sizeof (*sri));
+    cmsg = (struct cmsghdr *)cbuf;
+    sri = (struct sctp_sndrcvinfo *)(cmsg + 1);
+
+    cmsg->cmsg_len = sizeof (*cmsg) + sizeof (*sri);
+    cmsg->cmsg_level = IPPROTO_SCTP;
+    cmsg->cmsg_type  = SCTP_SNDRCV;
+
+    /* Fill up stream info of sndrcvinfo struct - not filling anything else ? */
+    /* Payload protocol ID - dont need this ? */
+    sri->sinfo_ppid   = 1;
+
+    /* Send on stream_id. */
+    sri->sinfo_stream = stream_id;
+    if (sock->options & APR_INCOMPLETE_WRITE) {
+        sock->options &= ~APR_INCOMPLETE_WRITE;
+        goto do_select;
+    }
+
+    do {
+        rv = sendmsg(sock->socketdes, &msg, 0);
+    } while (rv == -1 && errno == EINTR);
+
+   /* Refer FIXME in apr_socket_recv_sctp */
+   /* while (rv == -1 && (errno == EAGAIN || errno == EWOULDBLOCK) */
+   if (rv == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)  
+        && (sock->timeout > 0)) {
+        apr_status_t arv;
+do_select:
+        arv = apr_wait_for_io_or_timeout(NULL, sock, 0);
+        if (arv != APR_SUCCESS) {
+            *len = 0;
+            return arv;
+        }
+        else {
+            do {
+                rv = sendmsg(sock->socketdes, &msg, 0);
+            } while (rv == -1 && errno == EINTR);
+        }
+    }
+    if (rv == -1) {
+        *len = 0;
+        return errno;
+    }
+    if ((sock->timeout > 0) && (rv < requested_len)) {
+        sock->options |= APR_INCOMPLETE_WRITE;
+    }
+    (*len) = rv;
+    return APR_SUCCESS;
+}
+#endif /* End APR_HAS_SCTP_STREAMS */
 
 apr_status_t apr_socket_sendv(apr_socket_t * sock, const struct iovec *vec,
                               apr_int32_t nvec, apr_size_t *len)

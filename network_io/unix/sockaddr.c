@@ -234,6 +234,151 @@ APR_DECLARE(apr_status_t) apr_socket_addr_get(apr_sockaddr_t **sa,
     return APR_SUCCESS;
 }
 
+
+/* JTL - 2013-MAR-20
+ * Adding support for specfying multiple IP addresses to bind the SCTP socket
+ * to. This is only called by the new ListenSCTP directive. Multiple IP
+ * addresses are expected to be of the form {a.b.c.d, e.f.g.h}:port. Only IPV4
+ * numeric addresses are accepted with the {...}:port format at this time. The
+ * old form of specifying SCTP (e.g. a.b.c.d:port/sctp) is no longer valid.
+ */
+
+#if APR_HAVE_SCTP
+APR_DECLARE(apr_status_t) apr_parse_multiaddr_port(char **addr, char **scope_id,
+                                              apr_port_t *port, const char *str,
+                                              apr_pool_t *p)
+{
+    const char *ch, *lastchar;
+    char *str_temp, *str_local, *unused;
+    int big_port;
+    apr_size_t addrlen;
+
+    *addr = NULL;         /* assume not specified */
+    *scope_id = NULL;     /* assume not specified */
+    *port = 0;            /* assume not specified */
+
+    /* First handle the optional port number.  That may be all that
+     * is specified in the string.
+     */
+    ch = lastchar = str + strlen(str) - 1;
+    while (ch >= str && apr_isdigit(*ch)) {
+        --ch;
+    }
+
+    if (ch < str) {       /* Entire string is the port */
+        big_port = atoi(str);
+        if (big_port < 1 || big_port > 65535) {
+            return APR_EINVAL;
+        }
+        *port = big_port;
+        return APR_SUCCESS;
+    }
+
+    if (*ch == ':' && ch < lastchar) { /* host and port number specified */
+        if (ch == str) {               /* string starts with ':' -- bad */
+            return APR_EINVAL;
+        }
+        big_port = atoi(ch + 1);
+       if (big_port < 1 || big_port > 65535) {
+            return APR_EINVAL;
+        }
+        *port = big_port;
+        lastchar = ch - 1;
+    }
+
+    /* now handle the hostname */
+    addrlen = lastchar - str + 1;
+
+    /* JTL - 2013-MAR-13
+     * check for multiple IP addresses
+     * only AF_INET IP addresses are allowed at this time */
+    if (str && *str == '{') {
+        //exclude '{' from *addr
+        *addr = apr_pstrdup(p, str + 1);
+        --addrlen;
+        lastchar = *addr + addrlen - 1;
+        char *end_brace = memchr(*addr, '}', addrlen);
+
+        if (!end_brace || end_brace != lastchar) {
+            *port = 0;
+            return APR_EINVAL;
+        }
+
+        /* convert closing '}' to ',', unless there is only one address */
+        if (!memchr(*addr, ',', addrlen))
+            *end_brace = ' ';
+        else
+            *end_brace = ',';
+
+        /* remove all space from IP addr list */
+        addrlen = 0;
+        for (ch = *addr; ch <= lastchar; ++ch) {
+            if (!apr_isspace(*ch))
+                (*addr)[addrlen++] = *ch;
+        }
+        (*addr)[addrlen] = '\0';
+        //printf("IP addr list = %s\n", *addr);
+    } else
+
+/* XXX we don't really have to require APR_HAVE_IPV6 for this;
+ * just pass char[] for ipaddr (so we don't depend on struct in6_addr)
+ * and always define APR_INET6
+ */
+#if APR_HAVE_IPV6
+    if (*str == '[') {
+        const char *end_bracket = memchr(str, ']', addrlen);
+        struct in6_addr ipaddr;
+        const char *scope_delim;
+
+        if (!end_bracket || end_bracket != lastchar) {
+            *port = 0;
+            return APR_EINVAL;
+        }
+
+        /* handle scope id; this is the only context where it is allowed */
+        scope_delim = memchr(str, '%', addrlen);
+        if (scope_delim) {
+            if (scope_delim == end_bracket - 1) { /* '%' without scope id */
+                *port = 0;
+                return APR_EINVAL;
+            }
+            addrlen = scope_delim - str - 1;
+            *scope_id = apr_palloc(p, end_bracket - scope_delim);
+            memcpy(*scope_id, scope_delim + 1, end_bracket - scope_delim - 1);
+            (*scope_id)[end_bracket - scope_delim - 1] = '\0';
+        }
+        else {
+            addrlen = addrlen - 2; /* minus 2 for '[' and ']' */
+        }
+
+        *addr = apr_palloc(p, addrlen + 1);
+        memcpy(*addr,
+               str + 1,
+               addrlen);
+        (*addr)[addrlen] = '\0';
+        if (apr_inet_pton(AF_INET6, *addr, &ipaddr) != 1) {
+            *addr = NULL;
+            *scope_id = NULL;
+            *port = 0;
+            return APR_EINVAL;
+        }
+    }
+    else
+#endif
+    {
+        /* XXX If '%' is not a valid char in a DNS name, we *could* check
+         *     for bogus scope ids first.
+         */
+        *addr = apr_palloc(p, addrlen + 1);
+        memcpy(*addr, str, addrlen);
+        (*addr)[addrlen] = '\0';
+    }
+    return APR_SUCCESS;
+}
+
+#endif /* End APR_HAVE_SCTP */
+
+
 APR_DECLARE(apr_status_t) apr_parse_addr_port(char **addr,
                                               char **scope_id,
                                               apr_port_t *port,
@@ -335,7 +480,7 @@ static apr_status_t call_resolver(apr_sockaddr_t **sa,
                                   apr_port_t port, apr_int32_t flags, 
                                   apr_pool_t *p)
 {
-    struct addrinfo hints, *ai, *ai_list;
+    struct addrinfo hints, *ai, *ai_list = NULL;
     apr_sockaddr_t *prev_sa;
     int error;
     char *servname = NULL; 
@@ -390,7 +535,7 @@ static apr_status_t call_resolver(apr_sockaddr_t **sa,
         servname = apr_itoa(p, port);
 #endif /* OSF1 */
     }
-    error = getaddrinfo(hostname, servname, &hints, &ai_list);
+
 #ifdef HAVE_GAI_ADDRCONFIG
     /*
      * Using AI_ADDRCONFIG involves some unfortunate guesswork because it
@@ -416,6 +561,63 @@ static apr_status_t call_resolver(apr_sockaddr_t **sa,
         error = getaddrinfo(hostname, servname, &hints, &ai_list);
     }
 #endif
+
+    /* JTL - 2013-MAR-14 */
+    /* hack in method to handle mulitple IP addresses for SCTP (ListenSCTP only) */
+#if APR_HAVE_SCTP
+    apr_sockaddr_t *sa_list;
+    prev_sa = NULL;
+    char *delim;
+    if (hostname && (delim = memchr(hostname, ',', strlen(hostname)))) {
+        if (family == APR_UNSPEC)
+            family = AF_INET;
+        else if (family != AF_INET) {
+            return APR_EINVAL;
+        }
+        /* use first address as hostname */
+        char *host = apr_pstrmemdup(p, hostname, delim - hostname);
+
+        char *addr = hostname;
+        int listlen = strlen(hostname);
+        int addrlen;
+        struct sockaddr_in sin;
+        int rv;
+        apr_sockaddr_t *new_sa;
+        /* create linked list of apr_socket_t for each address */
+        while (delim = memchr(addr, ',', listlen)) {
+            addrlen = delim - addr;
+            addr[addrlen] = '\0';
+            rv = inet_pton(family, addr, &sin.sin_addr);
+            if (rv == 1) {
+                new_sa = apr_pcalloc(p, sizeof(apr_sockaddr_t));
+                new_sa->pool = p;
+                //inet_pton(family, addr, &new_sa->sa.sin.sin_addr);
+                memcpy(&new_sa->sa.sin.sin_addr, &sin.sin_addr, sizeof(struct in_addr));
+                apr_sockaddr_vars_set(new_sa, family, port);
+                if (!prev_sa) {
+                    new_sa->hostname = apr_pstrdup(p, host);
+                    sa_list = new_sa;
+                } else {
+                    new_sa->hostname = prev_sa->hostname;
+                    prev_sa->next = new_sa;
+                }
+            } else if (rv == 0) {
+                printf("invalid address \"%s\" for AF_INET\n", addr);
+                return APR_EINVAL;
+            } else {
+                printf("invalid address \"%s\" for family %d\n", addr, family);
+                return APR_EINVAL;
+            }
+            prev_sa = new_sa;
+            addr = delim + 1;
+            listlen -= (addrlen + 1);
+        }
+        *sa = sa_list;
+        error = 0;
+    } else
+#endif     /* APR_HAVE_SCTP */
+        error = getaddrinfo(hostname, servname, &hints, &ai_list);
+
     if (error) {
 #if defined(WIN32)
         return apr_get_netos_error();
