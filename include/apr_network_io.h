@@ -405,6 +405,61 @@ APR_DECLARE(apr_status_t) apr_getnameinfo(char **hostname,
                                           apr_int32_t flags);
 
 /**
+ * Parse multiple IP addresses and a port for use with the SCTP transport
+ * protocol. This function is only called in conjuntion with the ListenSCTP
+ * directive and the resulting SCTP socket will attempt to bind to all specified
+ * IP addresses. Note that at this time, only IPV4 numberic addresses are
+ * allowed when specifying multiple IP addresses. This function is declared and
+ * defined only if SCTP is detected in the system during configure.
+ *                                   
+ * Any of the following strings are accepted:
+ *   8080                  (just the port number)
+ *   www.apache.org        (just the hostname)
+ *   www.apache.org:8080   (hostname and port number)
+ *   [fe80::1]:80          (IPv6 numeric address string only)
+ *   [fe80::1%eth0]        (IPv6 numeric address string and scope id)
+ *   a.b.c.d:4000          (numeric IPV4 address with a port number)
+ *   {a.b.c.d}:4000        (numeric IPV4 address as a list with a port number)
+ *   {a.b.c.d, e.f.g.h, i.j.k.l}:4000 (multiple numeric IPV4 addresses with a
+ *                                     port number)
+ *
+ * Invalid strings:
+ *                         (empty string)
+ *   [abc]                 (not valid IPv6 numeric address string)
+ *   abc:65536             (invalid port number)
+ *   a.b.c.d               (numeric IP requires port number)
+ *   {a.b.c.d}             (numeric IP requires port number)
+ *   {www.apache.org}      ({...} format only allows IPV4 numeric addresses)
+ *
+ * @param addr The new buffer contains a comma spearated list of all specified
+ *             IP addresses. The list contains no whitespace and, if there is
+ *             more than one IP address specified, the list ends with a comma.
+ *             On output, *addr will be NULL if no hostname/IP address was
+ *             specfied.
+ * @param scope_id The new buffer containing just the scope id.  On output,
+ *                 *scope_id will be NULL if no scope id was specified.
+ * @param port The port number.  On output, *port will be 0 if no port was
+ *             specified.
+ *             ### FIXME: 0 is a legal port (per RFC 1700). this should
+ *             ### return something besides zero if the port is missing.
+ * @param str The input string to be parsed.
+ * @param p The pool from which *addr and *scope_id are allocated.
+ * @remark If scope id shouldn't be allowed, check for scope_id != NULL in
+ *         addition to checking the return code.  If addr/hostname should be
+ *         required, check for addr == NULL in addition to checking the
+ *         return code.
+ */
+
+#if APR_HAVE_SCTP
+APR_DECLARE(apr_status_t) apr_parse_multiaddr_port(char **addr,
+                                              char **scope_id,
+                                              apr_port_t *port,
+                                              const char *str,
+                                              apr_pool_t *p);
+#endif
+
+
+/**
  * Parse hostname/IP address with scope id and port.
  *
  * Any of the following strings are accepted:
@@ -489,6 +544,35 @@ APR_DECLARE(apr_status_t) apr_socket_data_set(apr_socket_t *sock, void *data,
 APR_DECLARE(apr_status_t) apr_socket_send(apr_socket_t *sock, const char *buf, 
                                           apr_size_t *len);
 
+/**
+ * Send data over a network on a particular SCTP stream id.
+ * Function declared and defined only if SCTP and sendmsg/recvmsg
+ * are detected in the system during configure.
+ *
+ * @param sock The socket to send the data over.
+ * @param buf The buffer which contains the data to be sent.
+ * @param len On entry, the number of bytes to send; on exit, the number  
+ *            of bytes sent.
+ * @param stream_id The SCTP stream id to send the data on.
+ * @remark 
+ * <PRE>
+ * This functions acts like a blocking write by default.  To change
+ * this behavior, use apr_socket_timeout_set().
+ *
+ * It is possible for both bytes to be sent and an error to be returned.
+ *
+ * APR_EINTR is never returned.
+ * </PRE>
+ */
+
+#if APR_HAS_SCTP_STREAMS
+APR_DECLARE(apr_status_t) apr_socket_send_sctp(apr_socket_t *sock,
+                                const char *buf, apr_size_t *len,
+                                apr_uint16_t stream_id);
+
+#endif
+
+
 /** @deprecated @see apr_socket_send */
 APR_DECLARE(apr_status_t) apr_send(apr_socket_t *sock, const char *buf, 
                                    apr_size_t *len);
@@ -513,6 +597,36 @@ APR_DECLARE(apr_status_t) apr_send(apr_socket_t *sock, const char *buf,
 APR_DECLARE(apr_status_t) apr_socket_sendv(apr_socket_t *sock, 
                                            const struct iovec *vec,
                                            apr_int32_t nvec, apr_size_t *len);
+
+/**
+ * Send multiple packets of data over a network on a particular SCTP stream id.
+ * Function declared and defined only if SCTP and sendmsg/recvmsg
+ * are detected in the system during configure.
+ * apr_socket_sendv_sctp = {writev + send on a particular sctp stream}
+ *
+ * @param sock The socket to send the data over.
+ * @param vec The array of iovec structs containing the data to send
+ * @param nvec The number of iovec structs in the array
+ * @param len Receives the number of bytes actually written
+ * @remark
+ * <PRE>
+ * This functions acts like a blocking write by default.  To change
+ * this behavior, use apr_socket_timeout_set().
+ * The number of bytes actually sent is stored in argument 3.
+ *
+ * It is possible for both bytes to be sent and an error to be returned.
+ *
+ * APR_EINTR is never returned.
+ * </PRE>
+ */
+
+#if APR_HAS_SCTP_STREAMS
+
+APR_DECLARE(apr_status_t) apr_socket_sendv_sctp(apr_socket_t *sock,
+                                const struct iovec *vec, apr_int32_t nvec,
+                                apr_size_t *len, apr_uint16_t sctp_stream_id);
+
+#endif
 
 /** @deprecated @see apr_socket_sendv */
 APR_DECLARE(apr_status_t) apr_sendv(apr_socket_t *sock, 
@@ -605,6 +719,38 @@ APR_DECLARE(apr_status_t) apr_sendfile(apr_socket_t *sock, apr_file_t *file,
  */
 APR_DECLARE(apr_status_t) apr_socket_recv(apr_socket_t *sock, 
                                    char *buf, apr_size_t *len);
+
+/**
+ * Read data from a network and pass the SCTP stream id on which the
+ * data was read to the caller.
+ * Function declared and defined only if SCTP and sendmsg/recvmsg
+ * are detected in the system during configure.
+ * @param sock The socket to read the data from.
+ * @param buf The buffer to store the data in.
+ * @param len On entry, the number of bytes to receive; on exit, the number
+ *            of bytes received.
+ * @param stream_id On entry, junk; on exit, the SCTP stream id on which
+ *                  the bytes were received.
+ * @remark
+ * <PRE>
+ * This functions acts like a blocking read by default.  To change
+ * this behavior, use apr_socket_timeout_set().
+ * The number of bytes actually sent is stored in argument 3.
+ *
+ * It is possible for both bytes to be received and an APR_EOF or
+ * other error to be returned.
+ *
+ * APR_EINTR is never returned.
+ * </PRE>
+ */
+#if APR_HAS_SCTP_STREAMS
+
+APR_DECLARE(apr_status_t) apr_socket_recv_sctp(apr_socket_t *sock,
+                                        char *buf, apr_size_t *len,
+                                        apr_uint16_t *sctp_stream_id);
+
+#endif
+
 
 /** @deprecated @see apr_socket_recv */
 APR_DECLARE(apr_status_t) apr_recv(apr_socket_t *sock, 
